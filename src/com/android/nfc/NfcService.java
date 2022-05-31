@@ -17,6 +17,7 @@
 package com.android.nfc;
 
 import android.app.ActivityManager;
+import android.app.AlarmManager;
 import android.app.Application;
 import android.app.BroadcastOptions;
 import android.app.KeyguardManager;
@@ -36,6 +37,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.UserInfo;
 import android.content.res.Resources.NotFoundException;
+import android.database.ContentObserver;
 import android.media.AudioAttributes;
 import android.media.SoundPool;
 import android.net.Uri;
@@ -310,6 +312,7 @@ public class NfcService implements DeviceHostListener {
     private SharedPreferences.Editor mPrefsEditor;
     private PowerManager.WakeLock mRoutingWakeLock;
     private PowerManager.WakeLock mRequireUnlockWakeLock;
+    private final AlarmManager mAlarmManager;
 
     int mStartSound;
     int mEndSound;
@@ -330,6 +333,7 @@ public class NfcService implements DeviceHostListener {
     int mPollDelay;
     boolean mNotifyDispatchFailed;
     boolean mNotifyReadFailed;
+    private boolean autoTimeoutEnabled;
 
     // for recording the latest Tag object cookie
     long mCookieUpToDate = 0;
@@ -463,6 +467,7 @@ public class NfcService implements DeviceHostListener {
         mUserId = ActivityManager.getCurrentUser();
         mContext = nfcApplication;
 
+        mAlarmManager = (AlarmManager) nfcApplication.getSystemService(Context.ALARM_SERVICE);
         mNfcTagService = new TagService();
         mNfcAdapter = new NfcAdapterService();
         Log.i(TAG, "Starting NFC service");
@@ -620,6 +625,57 @@ public class NfcService implements DeviceHostListener {
         }
         mSEService = ISecureElementService.Stub.asInterface(ServiceManager.getService(
                 Context.SECURE_ELEMENT_SERVICE));
+        
+        autoTimeoutEnabled = isAutoTimeoutEnabled();
+        reconfigureNfcTimeoutListener();
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(Settings.Global.NFC_OFF_TIMEOUT),
+                false,
+                new ContentObserver(new Handler(nfcApplication.getMainLooper())) {
+                    @Override
+                    public void onChange(boolean selfChange) {
+                        super.onChange(selfChange);
+                        autoTimeoutEnabled = isAutoTimeoutEnabled();
+                        reconfigureNfcTimeoutListener();
+                    }
+                });
+    }
+
+    private final AlarmManager.OnAlarmListener  mAlarmListener = new AlarmManager.OnAlarmListener() {
+        @Override
+        public void onAlarm() {
+            try {
+                mNfcAdapter.disable(true);
+            } catch (RemoteException e) {
+                e.rethrowFromSystemServer();
+            }
+        }
+    };
+
+    private boolean isAutoTimeoutEnabled() {
+        long duration = nfcTimeoutDurationInMilli();
+        return duration != 0;
+    }
+
+    private void reconfigureNfcTimeoutListener() {
+        long duration = nfcTimeoutDurationInMilli();
+        final long timeout = SystemClock.elapsedRealtime() + duration;
+        if (duration == 0 || !isNfcEnabled()){
+            mAlarmManager.cancel(mAlarmListener);
+            return;
+        }
+        mAlarmManager.setExact(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                timeout,
+                "NFC Idle Timeout",
+                mAlarmListener,
+                new Handler(mContext.getMainLooper())
+        );
+    }
+
+    private long nfcTimeoutDurationInMilli() {
+        return Settings.Global.getLong(mContext.getContentResolver(),
+                Settings.Global.NFC_OFF_TIMEOUT, 0);
     }
 
     private boolean isSEServiceAvailable() {
@@ -2482,6 +2538,7 @@ public class NfcService implements DeviceHostListener {
     final class NfcServiceHandler extends Handler {
         @Override
         public void handleMessage(Message msg) {
+            reconfigureNfcTimeoutListener();
             switch (msg.what) {
                 case MSG_ROUTE_AID: {
                     int route = msg.arg1;
